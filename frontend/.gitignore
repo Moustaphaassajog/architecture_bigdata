@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+notaire_cookies.json
+tmp/
+KboOpenData_*/
+KboOpenData_*.zip
+.env
+logs_*.txt
+logs_airflow/
+
+frontend/node_modules/
+frontend/dist/
+
+*.ipynb_checkpoints/
