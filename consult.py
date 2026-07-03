@@ -1,13 +1,27 @@
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import time
 import requests
 import pandas as pd
 from io import StringIO
 from pathlib import Path
+from datetime import datetime
 
-from state_manager import deja_traite, marquer_pending, marquer_done, marquer_error
+from state_manager import (
+    deja_traite, marquer_pending, marquer_in_progress,
+    marquer_done, marquer_error, state_coll
+)
+from hdfs_utils import upload_to_hdfs
+from mongo_utils import get_all_bce_numbers
 
 TMP = Path("tmp/pdfs")
 TMP.mkdir(parents=True, exist_ok=True)
+
+TMP_HOTELLERIE = Path("tmp/hotellerie")
+TMP_HOTELLERIE.mkdir(parents=True, exist_ok=True)
 
 BASE = "https://consult.cbso.nbb.be/api"
 
@@ -26,7 +40,7 @@ def make_session(enterprise_number: str) -> requests.Session:
     session.headers.update(HEADERS)
     page_url = f"https://consult.cbso.nbb.be/consult-enterprise/{enterprise_number}"
     session.headers.update({"Referer": page_url})
-    session.get(page_url)  # establishes ASLBSA, ASLBSACORS, JSESSIONID cookies
+    session.get(page_url, timeout=15)
     return session
 
 
@@ -36,7 +50,7 @@ def get_deposits(session: requests.Session, enterprise_number: str) -> list:
         f"?page=0&size=10&enterpriseNumber={enterprise_number}"
         f"&sort=periodEndDate,desc&sort=depositDate,desc"
     )
-    r = session.get(url)
+    r = session.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     print(f"Found {data['totalElements']} filings ({data['totalPages']} pages). Loading first {len(data['content'])}.")
@@ -45,13 +59,13 @@ def get_deposits(session: requests.Session, enterprise_number: str) -> list:
 
 def download_csv(session: requests.Session, deposit_id: str) -> str:
     url = f"{BASE}/external/broker/public/deposits/consult/csv/{deposit_id}"
-    r = session.get(url)
+    r = session.get(url, timeout=15)
     r.raise_for_status()
     return r.text
 
 
 def download_pdf(session: requests.Session, deposit: dict) -> Path:
-    """Download PDF for a deposit and save to tmp/pdfs/. Returns the saved path."""
+    """Télécharge le PDF d'un dépôt, l'upload vers HDFS Bronze, met à jour la State DB."""
     deposit_id  = deposit["id"]
     year        = deposit["periodEndDateYear"]
     enterprise  = deposit["enterpriseNumber"]
@@ -60,22 +74,24 @@ def download_pdf(session: requests.Session, deposit: dict) -> Path:
     dest        = TMP / filename
 
     if deja_traite(enterprise, deposit_id, "comptes_annuels"):
-        print(f"    Déjà traité (state DB) : {filename}")
-        return dest if dest.exists() else None
+        print(f"    Deja traite (state DB) : {filename}")
+        return dest
 
     marquer_pending(enterprise, deposit_id, "comptes_annuels", annee=year)
 
     try:
         url = f"{BASE}/external/broker/public/deposits/pdf/{deposit_id}"
-        r = session.get(url)
+        r = session.get(url, timeout=30)
         r.raise_for_status()
         dest.write_bytes(r.content)
-        marquer_done(enterprise, deposit_id, "comptes_annuels", chemin_hdfs=str(dest))
-        print(f"    PDF saved: {filename} ({len(r.content) // 1024} KB)")
+
+        hdfs_path = upload_to_hdfs(str(dest), f"/bronze/nbb/{enterprise}")
+        marquer_done(enterprise, deposit_id, "comptes_annuels", chemin_hdfs=hdfs_path)
+        print(f"    PDF saved + HDFS : {filename} -> {hdfs_path}")
         return dest
     except Exception as e:
         marquer_error(enterprise, deposit_id, "comptes_annuels", str(e))
-        print(f"    ✗ PDF failed for {year}: {e}")
+        print(f"    Echec PDF pour {year}: {e}")
         return None
 
 
@@ -141,11 +157,9 @@ def get_all_kpis(enterprise_number: str) -> list[dict]:
 
         print(f"  Processing {year} (id={deposit_id})...")
 
-        # Always attempt PDF download (works for all years including migrated)
         download_pdf(session, deposit)
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-        # CSV only available for non-migrated filings
         if deposit.get("migration"):
             print(f"    Skipping CSV for {year} (legacy/migrated filing)")
             continue
@@ -158,21 +172,158 @@ def get_all_kpis(enterprise_number: str) -> list[dict]:
             kpis["reference"] = deposit["reference"]
             results.append(kpis)
         except Exception as e:
-            print(f"    ✗ CSV failed for {year}: {e}")
-        time.sleep(0.3)
+            print(f"    Echec CSV pour {year}: {e}")
+        time.sleep(0.5)
 
     return results
 
 
-# --- Run ---
+def run_for_all_enterprises():
+    """Lit tous les BCE depuis MongoDB et lance get_all_kpis() pour chacun,
+    avec gestion des coupures réseau temporaires."""
+    bce_list = get_all_bce_numbers()
+    print(f"{len(bce_list)} entreprises trouvees dans MongoDB.")
+
+    traitees, erreurs = 0, 0
+
+    for i, bce in enumerate(bce_list, start=1):
+        print(f"\n{'='*50}\n[{i}/{len(bce_list)}] BCE {bce}")
+        try:
+            get_all_kpis(bce)
+            traitees += 1
+        except requests.exceptions.ConnectTimeout:
+            print(f"  Timeout reseau pour {bce} -- pause 20s puis on continue")
+            erreurs += 1
+            time.sleep(20)
+        except requests.exceptions.ConnectionError as e:
+            print(f"  Erreur de connexion pour {bce} : {e} -- pause 20s")
+            erreurs += 1
+            time.sleep(20)
+        except Exception as e:
+            print(f"  Erreur generale pour {bce} : {e}")
+            erreurs += 1
+
+        time.sleep(1)
+
+    print(f"\nTermine : {traitees} entreprises traitees, {erreurs} erreurs.")
+
+
+# ============================================================
+# SECTION HOTELLERIE — Jour 2, Part 2
+# ============================================================
+
+TYPE_DOC_HOTELLERIE = "comptes_annuels_hotellerie"
+ANNEE_MIN_HOTELLERIE = 2021
+
+
+def get_pending_hotellerie() -> list[dict]:
+    """Retourne les entreprises hôtelières encore en 'pending' dans download_state."""
+    return list(state_coll.find(
+        {"type_document": TYPE_DOC_HOTELLERIE, "statut": "pending"},
+        {"bce_number": 1, "_id": 0}
+    ))
+
+
+def download_csv_hotellerie(session: requests.Session, enterprise: str, deposit: dict) -> str | None:
+    """Télécharge et uploade le CSV d'un dépôt hôtelier vers /bronze/hotellerie/{bce}/{year}/{ref}."""
+    deposit_id = deposit["id"]
+    year       = deposit["periodEndDateYear"]
+    reference  = deposit["reference"]
+
+    if deposit.get("migration"):
+        print(f"    Skip CSV {year} (legacy/migrated filing, pas de CSV disponible)")
+        return None
+
+    try:
+        csv_text = download_csv(session, deposit_id)
+
+        filename = f"{enterprise}_{year}_{reference}.csv"
+        local_path = TMP_HOTELLERIE / filename
+        local_path.write_text(csv_text, encoding="utf-8")
+
+        hdfs_dir = f"/bronze/hotellerie/{enterprise}/{year}"
+        hdfs_path = upload_to_hdfs(str(local_path), hdfs_dir)
+
+        print(f"    CSV saved + HDFS : {filename} -> {hdfs_path}")
+        return hdfs_path
+    except Exception as e:
+        print(f"    Echec CSV {year} (ref={reference}): {e}")
+        return None
+
+
+def scrape_entreprise_hotellerie(session: requests.Session, bce: str) -> int:
+    """Scrape les dépôts >= 2021 d'une entreprise hôtelière. Retourne le nombre de CSV réussis."""
+    deposits = get_deposits(session, bce)
+
+    deposits_recents = [
+        d for d in deposits
+        if d.get("periodEndDateYear") and int(d["periodEndDateYear"]) >= ANNEE_MIN_HOTELLERIE
+    ]
+    print(f"  {len(deposits_recents)} depot(s) >= {ANNEE_MIN_HOTELLERIE} sur {len(deposits)} au total")
+
+    filings_count = 0
+    for deposit in deposits_recents:
+        year = deposit["periodEndDateYear"]
+        print(f"  Processing {year} (id={deposit['id']})...")
+        hdfs_path = download_csv_hotellerie(session, bce, deposit)
+        if hdfs_path:
+            filings_count += 1
+        time.sleep(0.5)
+
+    return filings_count
+
+
+def run_hotellerie_scraping():
+    """Scrape les entreprises hôtelières marquées 'pending' dans download_state,
+    filtre les dépôts >= 2021, uploade les CSV vers /bronze/hotellerie/..., met à jour la State DB."""
+    entreprises = get_pending_hotellerie()
+    print(f"{len(entreprises)} entreprises hotellerie en attente (pending).")
+
+    traitees, erreurs = 0, 0
+
+    for i, ent in enumerate(entreprises, start=1):
+        bce = ent["bce_number"]
+        print(f"\n{'='*50}\n[{i}/{len(entreprises)}] BCE {bce}")
+
+        marquer_in_progress(bce, "ALL", TYPE_DOC_HOTELLERIE)
+
+        try:
+            session = make_session(bce)
+            filings_count = scrape_entreprise_hotellerie(session, bce)
+
+            marquer_done(bce, "ALL", TYPE_DOC_HOTELLERIE, filings_count=filings_count)
+            print(f"  -> Termine : {filings_count} depot(s) scrape(s) avec succes")
+            traitees += 1
+
+        except requests.exceptions.ConnectTimeout:
+            marquer_error(bce, "ALL", TYPE_DOC_HOTELLERIE, "Timeout reseau")
+            print(f"  Timeout reseau pour {bce} -- pause 20s")
+            erreurs += 1
+            time.sleep(20)
+        except requests.exceptions.ConnectionError as e:
+            marquer_error(bce, "ALL", TYPE_DOC_HOTELLERIE, str(e))
+            print(f"  Erreur de connexion pour {bce} : {e} -- pause 20s")
+            erreurs += 1
+            time.sleep(20)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                marquer_pending(bce, "ALL", TYPE_DOC_HOTELLERIE)  # remis en pending pour reprise ulterieure
+                print(f"  429 Too Many Requests -- arret du run, {bce} remis en pending. Relancer plus tard.")
+                erreurs += 1
+                break
+            else:
+                marquer_error(bce, "ALL", TYPE_DOC_HOTELLERIE, str(e))
+                print(f"  Erreur HTTP pour {bce} : {e}")
+                erreurs += 1
+        except Exception as e:
+            marquer_error(bce, "ALL", TYPE_DOC_HOTELLERIE, str(e))
+            print(f"  Erreur generale pour {bce} : {e}")
+            erreurs += 1
+
+        time.sleep(2)
+
+    print(f"\nTermine : {traitees} entreprises traitees, {erreurs} erreurs.")
+
+
 if __name__ == "__main__":
-    enterprise_number = "0203430576"  # Apple Retail Belgium
-    kpis = get_all_kpis(enterprise_number)
-
-    df = pd.DataFrame(kpis).set_index("year").sort_index(ascending=False)
-    pd.set_option("display.float_format", "{:,.2f}".format)
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 200)
-
-    print("\n=== KPI Summary ===")
-    print(df[["entity", "period_end", "chiffre_affaires", "ebitda", "resultat_net", "marge_nette", "autonomie_fin"]])
+    run_hotellerie_scraping()

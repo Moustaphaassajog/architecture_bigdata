@@ -37,16 +37,39 @@ def marquer_pending(bce_number: str, deposit_id: str, type_document: str, annee:
     )
 
 
-def marquer_done(bce_number: str, deposit_id: str, type_document: str, chemin_hdfs: str):
-    """Marque un document comme correctement téléchargé et stocké."""
+def marquer_in_progress(bce_number: str, deposit_id: str, type_document: str):
+    """Marque une entrée comme en cours de traitement (évite les retraitements concurrents)."""
+    now = datetime.now(timezone.utc)
     state_coll.update_one(
         {"bce_number": bce_number, "deposit_id": str(deposit_id), "type_document": type_document},
-        {"$set": {
-            "statut": "done",
-            "chemin_hdfs": chemin_hdfs,
-            "timestamp_maj": datetime.now(timezone.utc),
-            "erreur_message": None
-        }}
+        {
+            "$set": {"statut": "in_progress", "timestamp_maj": now},
+            "$setOnInsert": {
+                "timestamp_creation": now,
+                "chemin_hdfs": None,
+                "erreur_message": None,
+                "tentatives": 0
+            }
+        },
+        upsert=True
+    )
+
+
+def marquer_done(bce_number: str, deposit_id: str, type_document: str, chemin_hdfs: str = None, filings_count: int = None):
+    """Marque un document (ou une entreprise entière) comme correctement traité."""
+    update_fields = {
+        "statut": "done",
+        "timestamp_maj": datetime.now(timezone.utc),
+        "erreur_message": None
+    }
+    if chemin_hdfs is not None:
+        update_fields["chemin_hdfs"] = chemin_hdfs
+    if filings_count is not None:
+        update_fields["filings_count"] = filings_count
+
+    state_coll.update_one(
+        {"bce_number": bce_number, "deposit_id": str(deposit_id), "type_document": type_document},
+        {"$set": update_fields}
     )
 
 

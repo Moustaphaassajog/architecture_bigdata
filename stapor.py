@@ -1,3 +1,8 @@
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 import json
 import logging
 import time
@@ -7,6 +12,8 @@ import requests
 from playwright.sync_api import sync_playwright
 
 from state_manager import deja_traite, marquer_pending, marquer_done, marquer_error
+from hdfs_utils import upload_to_hdfs
+from mongo_utils import get_all_entreprises
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +37,6 @@ SEED_BCE = "0836157420"
 
 
 def _fetch_cookies_via_playwright() -> list[dict]:
-    """
-    Ouvre ton Chrome installé (visible ~3s) pour passer le challenge F5.
-    Retourne la liste brute de cookies Playwright.
-    """
     seed_url = (
         f"{BASE}/enterprise/{SEED_BCE}/statutes"
         f"?enterpriseNumber={SEED_BCE}&statuteStart=0&statuteCount=5"
@@ -44,7 +47,7 @@ def _fetch_cookies_via_playwright() -> list[dict]:
         try:
             browser = p.chromium.launch(channel="chrome", headless=False)
         except Exception:
-            log.warning("Chrome introuvable — fallback sur Chromium")
+            log.warning("Chrome introuvable -- fallback sur Chromium")
             browser = p.chromium.launch(headless=False)
 
         ctx  = browser.new_context(
@@ -55,14 +58,12 @@ def _fetch_cookies_via_playwright() -> list[dict]:
             ),
         )
         page = ctx.new_page()
-
         page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
         page.goto("https://statuts.notaire.be/", wait_until="load", timeout=20_000)
         page.wait_for_timeout(2000)
-
         page.goto(seed_url, wait_until="load", timeout=30_000)
 
         for i in range(40):
@@ -72,7 +73,7 @@ def _fetch_cookies_via_playwright() -> list[dict]:
                 break
             page.wait_for_timeout(500)
         else:
-            log.warning(f"  Timeout — cookies présents : {[c['name'] for c in ctx.cookies()]}")
+            log.warning(f"  Timeout -- cookies presents : {[c['name'] for c in ctx.cookies()]}")
 
         cookies = ctx.cookies()
         browser.close()
@@ -89,7 +90,6 @@ def _build_session(cookies: list[dict]) -> requests.Session:
 
 
 def _session_valid(session: requests.Session) -> bool:
-    """Ping rapide — True si on reçoit du JSON (session encore valide)."""
     try:
         r = session.get(
             f"{BASE}/api/enterprises/{SEED_BCE}/statutes",
@@ -101,55 +101,68 @@ def _session_valid(session: requests.Session) -> bool:
         return False
 
 
-def get_session() -> requests.Session:
-    """
-    Retourne une session requests valide.
-    - Charge notaire_cookies.json si disponible et encore valides
-    - Relance Playwright automatiquement sinon (Chrome s'ouvre ~3s)
-    """
-    if COOKIE_FILE.exists():
+def get_session(force_refresh: bool = False) -> requests.Session:
+    if not force_refresh and COOKIE_FILE.exists():
         cookies = json.loads(COOKIE_FILE.read_text())
         session = _build_session(cookies)
         if _session_valid(session):
             log.info("Session OK (cookies en cache)")
             return session
-        log.info("Cookies expirés — renouvellement automatique...")
+        log.info("Cookies expires -- renouvellement automatique...")
 
     cookies = _fetch_cookies_via_playwright()
     COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
-    log.info(f"Cookies sauvegardés → {COOKIE_FILE}")
+    log.info(f"Cookies sauvegardes -> {COOKIE_FILE}")
     return _build_session(cookies)
 
 
-def get_statutes(session: requests.Session, enterprise_number: str) -> list[dict]:
+def get_statutes(session: requests.Session, enterprise_number: str, retry_on_expired: bool = True) -> list[dict]:
     url = f"{BASE}/api/enterprises/{enterprise_number}/statutes"
     session.headers["Referer"] = (
         f"{BASE}/enterprise/{enterprise_number}/statutes"
         f"?enterpriseNumber={enterprise_number}&statuteStart=0&statuteCount=5"
     )
     all_statutes, offset = [], 0
+    max_429_retries = 3
+    retries = 0
 
     while True:
         r = session.get(url, params={"deedDate": "", "offset": offset, "limit": PAGE_SIZE}, timeout=15)
+
+        if r.status_code == 429:
+            retries += 1
+            if retries > max_429_retries:
+                log.error(f"[{enterprise_number}] Trop de 429 consecutifs -- abandon de cette entreprise")
+                return []
+            log.warning(f"[{enterprise_number}] 429 Too Many Requests -- pause 60s ({retries}/{max_429_retries})...")
+            time.sleep(60)
+            continue
+
+        retries = 0
         r.raise_for_status()
 
         if "application/json" not in r.headers.get("content-type", ""):
-            log.error(f"[{enterprise_number}] Réponse non-JSON — session expirée mid-run")
+            if retry_on_expired:
+                log.warning(f"[{enterprise_number}] Session expiree -- renouvellement...")
+                new_session = get_session(force_refresh=True)
+                session.cookies.update(new_session.cookies)
+                return get_statutes(session, enterprise_number, retry_on_expired=False)
+            log.error(f"[{enterprise_number}] Reponse non-JSON apres renouvellement -- abandon")
             break
 
         data  = r.json()
         batch = data.get("statutes", [])
         total = data.get("totalItems", 0)
         all_statutes.extend(batch)
-        log.info(f"  [{enterprise_number}] offset={offset} — {len(batch)} statuts (total: {total})")
+        log.info(f"  [{enterprise_number}] offset={offset} -- {len(batch)} statuts (total: {total})")
 
         if not batch or len(all_statutes) >= total:
             break
         offset += PAGE_SIZE
-        time.sleep(0.3)
+        time.sleep(0.5)
 
     done = [s for s in all_statutes if s.get("documentStatus") == "DONE"]
-    log.info(f"  [{enterprise_number}] → {len(done)} DONE")
+    log.info(f"  [{enterprise_number}] -> {len(done)} DONE")
     return done
 
 
@@ -164,8 +177,8 @@ def download_statute_pdf(
     dest      = dest_dir / f"{enterprise_number}_{deed_date}_{doc_id}.pdf"
 
     if deja_traite(enterprise_number, doc_id, "statuts"):
-        log.info(f"    Déjà traité (state DB) : {dest.name}")
-        return dest if dest.exists() else None
+        log.info(f"    Deja traite (state DB) : {dest.name}")
+        return dest
 
     marquer_pending(enterprise_number, doc_id, "statuts")
 
@@ -183,12 +196,14 @@ def download_statute_pdf(
             return None
 
         dest.write_bytes(r.content)
-        marquer_done(enterprise_number, doc_id, "statuts", chemin_hdfs=str(dest))
-        log.info(f"    Sauvegardé : {dest.name} ({len(r.content) // 1024} KB)")
+
+        hdfs_path = upload_to_hdfs(str(dest), f"/bronze/stapor/{enterprise_number}")
+        marquer_done(enterprise_number, doc_id, "statuts", chemin_hdfs=hdfs_path)
+        log.info(f"    Sauvegarde + HDFS : {dest.name} -> {hdfs_path}")
         return dest
     except Exception as e:
         marquer_error(enterprise_number, doc_id, "statuts", str(e))
-        log.error(f"    ✗ Échec téléchargement {doc_id}: {e}")
+        log.error(f"    Echec telechargement {doc_id}: {e}")
         return None
 
 
@@ -208,8 +223,51 @@ def get_all_statutes(
     return results
 
 
-def needs_notaire_check(forme_juridique: str, status: str = "Active") -> bool:
-    return status == "Active" and forme_juridique not in NO_NOTAIRE_FORMS
+def needs_notaire_check(forme_juridique: str, status: str = "AC") -> bool:
+    """status attendu : code KBO officiel, ex. 'AC' = actif."""
+    return status == "AC" and forme_juridique not in NO_NOTAIRE_FORMS
+
+
+def run_for_all_enterprises():
+    """Lit toutes les entreprises depuis MongoDB et lance get_all_statutes()
+    pour celles dont la forme juridique necessite une verification notariale."""
+    entreprises = get_all_entreprises()
+    log.info(f"{len(entreprises)} entreprises trouvees dans MongoDB.")
+
+    session = get_session()
+    traitees, skippees, erreurs = 0, 0, 0
+
+    for i, ent in enumerate(entreprises, start=1):
+        bce    = ent.get("EnterpriseNumber")
+        forme  = ent.get("JuridicalForm", "")
+        status = ent.get("Status", "AC")
+
+        if not bce:
+            continue
+
+        if not needs_notaire_check(forme, status):
+            skippees += 1
+            continue
+
+        log.info(f"\n{'='*50}\n[{i}/{len(entreprises)}] BCE {bce}")
+        try:
+            get_all_statutes(bce, session=session)
+            traitees += 1
+        except requests.exceptions.ConnectTimeout:
+            log.warning(f"  Timeout reseau pour {bce} -- pause 20s puis on continue")
+            erreurs += 1
+            time.sleep(20)
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"  Erreur de connexion pour {bce} : {e} -- pause 20s")
+            erreurs += 1
+            time.sleep(20)
+        except Exception as e:
+            log.error(f"  Erreur generale pour {bce} : {e}")
+            erreurs += 1
+
+        time.sleep(10)
+
+    log.info(f"\nTermine : {traitees} entreprises traitees, {skippees} ignorees, {erreurs} erreurs.")
 
 
 if __name__ == "__main__":
@@ -218,22 +276,4 @@ if __name__ == "__main__":
         format="%(asctime)s  %(levelname)-8s %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    ENTREPRISES = {
-        "Apple Retail Belgium": "0836157420",
-        "Google Belgium":       "0878065378",
-        "SNCB":                 "0203430576",
-    }
-
-    session = get_session()  # Playwright seulement si cookies expirés
-
-    for nom, bce in ENTREPRISES.items():
-        log.info(f"\n{'='*50}\n{nom} ({bce})")
-        statutes = get_all_statutes(bce, session=session)
-
-        if not statutes:
-            log.info("  Aucun statut disponible.")
-            continue
-
-        for s in statutes:
-            log.info(f"  {'✓' if s['local_pdf'] else '✗'} {s.get('deedDate')}  {s.get('documentTitle')}")
+    run_for_all_enterprises()
