@@ -1,0 +1,5 @@
+pymongo==4.8.0
+hdfs==2.7.3
+requests==2.32.3
+pandas==2.2.2
+playwright==1.47.0
